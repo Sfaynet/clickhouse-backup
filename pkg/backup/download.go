@@ -110,6 +110,11 @@ func (b *Backuper) Download(backupName string, tablePattern string, partitions [
 		}
 	}()
 
+	// Prefetch and cache all backup metadata from the chain upfront
+	if err := b.prefetchBackupMetadataChain(ctx, backupName); err != nil {
+		log.Warn().Err(err).Msg("prefetchBackupMetadataChain failed, continuing with on-demand fetching")
+	}
+
 	remoteBackups, err := b.dst.BackupList(ctx, true, backupName)
 	if err != nil {
 		return errors.WithMessage(err, "BackupList")
@@ -320,6 +325,10 @@ func (b *Backuper) Download(backupName string, tablePattern string, partitions [
 		"object_disk_size": utils.FormatBytes(backupMetadata.ObjectDiskSize),
 		"version":          backupVersion,
 	}).Msg("done")
+
+	// Clear backup metadata cache after download completes
+	storage.ClearBackupListCache()
+
 	return nil
 }
 
@@ -1461,4 +1470,49 @@ func (b *Backuper) getDownloadDiskForNonExistsDisk(notExistsDiskType string, fil
 		return false, "", 0, errors.Errorf("%s free space, not found in system.disks with `local` type", utils.FormatBytes(partSize))
 	}
 	return false, filteredDisks[leastUsedIdx].Name, filteredDisks[leastUsedIdx].FreeSpace - partSize, nil
+}
+
+// prefetchBackupMetadataChain - prefetch all backup metadata from the incremental chain upfront
+// This avoids repeated S3 API calls during download by loading all metadata into cache once
+func (b *Backuper) prefetchBackupMetadataChain(ctx context.Context, backupName string) error {
+	start := time.Now()
+	visited := make(map[string]bool)
+	backupChain := []string{}
+
+	// Discover the full backup chain by following RequiredBackup links
+	currentBackup := backupName
+	for currentBackup != "" && !visited[currentBackup] {
+		backupChain = append(backupChain, currentBackup)
+		visited[currentBackup] = true
+
+		// Load metadata for this backup - this will populate the cache
+		backupList, err := b.dst.BackupList(ctx, true, currentBackup)
+		if err != nil {
+			return errors.Wrapf(err, "BackupList for %s", currentBackup)
+		}
+
+		// Find the next backup in the chain
+		var found bool
+		for _, backup := range backupList {
+			if backup.BackupName == currentBackup {
+				currentBackup = backup.RequiredBackup
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			break
+		}
+	}
+
+	if len(backupChain) > 1 {
+		log.Info().Msgf("prefetchBackupMetadataChain: discovered chain of %d backups: %v (took %s)",
+			len(backupChain), backupChain, utils.HumanizeDuration(time.Since(start)))
+	} else {
+		log.Debug().Msgf("prefetchBackupMetadataChain: single backup, no chain (took %s)",
+			utils.HumanizeDuration(time.Since(start)))
+	}
+
+	return nil
 }
