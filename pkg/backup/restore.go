@@ -1959,7 +1959,7 @@ func (b *Backuper) RestoreData(ctx context.Context, backupName string, backupMet
 	if b.isEmbedded {
 		err = b.restoreDataEmbedded(ctx, backupName, dataOnly, version, tablesForRestore, partitionsNameList)
 	} else {
-		err = b.restoreDataRegular(ctx, backupName, backupMetadata, tablePattern, tablesForRestore, diskMap, diskTypes, disks, skipProjections, replicatedCopyToDetached, existingTablesSnapshot)
+		err = b.restoreDataRegular(ctx, backupName, backupMetadata, tablePattern, tablesForRestore, diskMap, diskTypes, disks, skipProjections, replicatedCopyToDetached, existingTablesSnapshot, nil)
 	}
 	if err != nil {
 		return errors.WithMessage(err, "restoreData")
@@ -1996,7 +1996,7 @@ func (b *Backuper) restoreDataEmbedded(ctx context.Context, backupName string, d
 	return b.restoreEmbedded(ctx, backupName, false, dataOnly, version, tablesForRestore, partitionsNameList)
 }
 
-func (b *Backuper) restoreDataRegular(ctx context.Context, backupName string, backupMetadata metadata.BackupMetadata, tablePattern string, tablesForRestore ListOfTables, diskMap, diskTypes map[string]string, disks []clickhouse.Disk, skipProjections []string, replicatedCopyToDetached bool, existingTablesSnapshot []clickhouse.Table) error {
+func (b *Backuper) restoreDataRegular(ctx context.Context, backupName string, backupMetadata metadata.BackupMetadata, tablePattern string, tablesForRestore ListOfTables, diskMap, diskTypes map[string]string, disks []clickhouse.Disk, skipProjections []string, replicatedCopyToDetached bool, existingTablesSnapshot []clickhouse.Table, chainCache *backupMetadataChainCache) error {
 	if len(b.cfg.General.RestoreDatabaseMapping) > 0 {
 		tablePattern = b.changeTablePatternFromRestoreMapping(tablePattern, "database")
 	}
@@ -2033,6 +2033,17 @@ func (b *Backuper) restoreDataRegular(ctx context.Context, backupName string, ba
 	reverseTableMapping := make(map[string]string)
 	for origName, targetName := range b.cfg.General.RestoreTableMapping {
 		reverseTableMapping[targetName] = origName
+	}
+
+	// Build a chain cache once before spawning goroutines so that
+	// findObjectDiskPartRecursiveCached can resolve required-part backup names
+	// without any S3 API calls or locking inside the hot goroutine path.
+	if chainCache == nil && backupMetadata.RequiredBackup != "" {
+		var cacheErr error
+		chainCache, cacheErr = b.buildBackupChainCache(ctx, backupMetadata, tablesForRestore)
+		if cacheErr != nil {
+			return errors.WithMessage(cacheErr, "buildBackupChainCache")
+		}
 	}
 
 	restoreBackupWorkingGroup, restoreCtx := errgroup.WithContext(ctx)
@@ -2097,15 +2108,16 @@ func (b *Backuper) restoreDataRegular(ctx context.Context, backupName string, ba
 
 		// Capture table metadata with filtered parts
 		capturedTableMetadata := table
+		capturedChainCache := chainCache
 
 		restoreBackupWorkingGroup.Go(func() error {
 			// https://github.com/Altinity/clickhouse-backup/issues/529
 			if b.cfg.ClickHouse.RestoreAsAttach {
-				if restoreErr := b.restoreDataRegularByAttach(restoreCtx, backupName, backupMetadata, capturedOrigDatabase, capturedOrigTable, diskMap, diskTypes, disks, dstTable, skipProjections, logger, replicatedCopyToDetached, capturedNeedsKeyRewrite, capturedTableMetadata); restoreErr != nil {
+				if restoreErr := b.restoreDataRegularByAttach(restoreCtx, backupName, backupMetadata, capturedOrigDatabase, capturedOrigTable, diskMap, diskTypes, disks, dstTable, skipProjections, logger, replicatedCopyToDetached, capturedNeedsKeyRewrite, capturedTableMetadata, capturedChainCache); restoreErr != nil {
 					return errors.WithMessage(restoreErr, "restoreDataRegularByAttach")
 				}
 			} else {
-				if restoreErr := b.restoreDataRegularByParts(restoreCtx, backupName, backupMetadata, capturedOrigDatabase, capturedOrigTable, diskMap, diskTypes, disks, dstTable, skipProjections, logger, replicatedCopyToDetached, capturedNeedsKeyRewrite, capturedTableMetadata); restoreErr != nil {
+				if restoreErr := b.restoreDataRegularByParts(restoreCtx, backupName, backupMetadata, capturedOrigDatabase, capturedOrigTable, diskMap, diskTypes, disks, dstTable, skipProjections, logger, replicatedCopyToDetached, capturedNeedsKeyRewrite, capturedTableMetadata, capturedChainCache); restoreErr != nil {
 					return errors.WithMessage(restoreErr, "restoreDataRegularByParts")
 				}
 			}
@@ -2131,7 +2143,7 @@ func (b *Backuper) restoreDataRegular(ctx context.Context, backupName string, ba
 	return nil
 }
 
-func (b *Backuper) restoreDataRegularByAttach(ctx context.Context, backupName string, backupMetadata metadata.BackupMetadata, origDatabase, origTable string, diskMap, diskTypes map[string]string, disks []clickhouse.Disk, dstTable clickhouse.Table, skipProjections []string, logger zerolog.Logger, replicatedCopyToDetached bool, needsKeyRewrite bool, filteredTableMetadata metadata.TableMetadata) error {
+func (b *Backuper) restoreDataRegularByAttach(ctx context.Context, backupName string, backupMetadata metadata.BackupMetadata, origDatabase, origTable string, diskMap, diskTypes map[string]string, disks []clickhouse.Disk, dstTable clickhouse.Table, skipProjections []string, logger zerolog.Logger, replicatedCopyToDetached bool, needsKeyRewrite bool, filteredTableMetadata metadata.TableMetadata, chainCache *backupMetadataChainCache) error {
 	// For Replicated*MergeTree tables with replicatedCopyToDetached, copy parts to detached folder
 	copyToDetached := replicatedCopyToDetached && strings.Contains(dstTable.Engine, "Replicated")
 
@@ -2161,7 +2173,7 @@ func (b *Backuper) restoreDataRegularByAttach(ctx context.Context, backupName st
 		Str("database", backupTable.Database).
 		Str("table", backupTable.Table).
 		Msg("download object_disks start")
-	if size, err = b.downloadObjectDiskParts(ctx, backupName, backupMetadata, backupTable, diskMap, diskTypes, disks, needsKeyRewrite); err != nil {
+	if size, err = b.downloadObjectDiskPartsWithCache(ctx, backupName, backupMetadata, backupTable, diskMap, diskTypes, disks, needsKeyRewrite, chainCache); err != nil {
 		return errors.Wrapf(err, "can't restore object_disk server-side copy data parts '%s.%s'", backupTable.Database, backupTable.Table)
 	}
 	if size > 0 {
@@ -2189,7 +2201,7 @@ func (b *Backuper) restoreDataRegularByAttach(ctx context.Context, backupName st
 	return nil
 }
 
-func (b *Backuper) restoreDataRegularByParts(ctx context.Context, backupName string, backupMetadata metadata.BackupMetadata, origDatabase, origTable string, diskMap, diskTypes map[string]string, disks []clickhouse.Disk, dstTable clickhouse.Table, skipProjections []string, logger zerolog.Logger, replicatedCopyToDetached bool, needsKeyRewrite bool, filteredTableMetadata metadata.TableMetadata) error {
+func (b *Backuper) restoreDataRegularByParts(ctx context.Context, backupName string, backupMetadata metadata.BackupMetadata, origDatabase, origTable string, diskMap, diskTypes map[string]string, disks []clickhouse.Disk, dstTable clickhouse.Table, skipProjections []string, logger zerolog.Logger, replicatedCopyToDetached bool, needsKeyRewrite bool, filteredTableMetadata metadata.TableMetadata, chainCache *backupMetadataChainCache) error {
 	// Use filtered table metadata from tablesForRestore (contains only parts matching partition filter)
 	// Set database and table names to original names for backup file lookup
 	backupTable := filteredTableMetadata
@@ -2204,7 +2216,7 @@ func (b *Backuper) restoreDataRegularByParts(ctx context.Context, backupName str
 	var size int64
 	var err error
 	start := time.Now()
-	if size, err = b.downloadObjectDiskParts(ctx, backupName, backupMetadata, backupTable, diskMap, diskTypes, disks, needsKeyRewrite); err != nil {
+	if size, err = b.downloadObjectDiskPartsWithCache(ctx, backupName, backupMetadata, backupTable, diskMap, diskTypes, disks, needsKeyRewrite, chainCache); err != nil {
 		return errors.Wrapf(err, "can't restore object_disk server-side copy data parts '%s.%s'", backupTable.Database, backupTable.Table)
 	}
 	log.Info().Str("duration", utils.HumanizeDuration(time.Since(start))).Str("size", utils.FormatBytes(uint64(size))).Str("database", backupTable.Database).Str("table", backupTable.Table).Msg("download object_disks finish")
@@ -2225,6 +2237,10 @@ func (b *Backuper) restoreDataRegularByParts(ctx context.Context, backupName str
 }
 
 func (b *Backuper) downloadObjectDiskParts(ctx context.Context, backupName string, backupMetadata metadata.BackupMetadata, backupTable metadata.TableMetadata, diskMap, diskTypes map[string]string, disks []clickhouse.Disk, needsKeyRewrite bool) (int64, error) {
+	return b.downloadObjectDiskPartsWithCache(ctx, backupName, backupMetadata, backupTable, diskMap, diskTypes, disks, needsKeyRewrite, nil)
+}
+
+func (b *Backuper) downloadObjectDiskPartsWithCache(ctx context.Context, backupName string, backupMetadata metadata.BackupMetadata, backupTable metadata.TableMetadata, diskMap, diskTypes map[string]string, disks []clickhouse.Disk, needsKeyRewrite bool, chainCache *backupMetadataChainCache) (int64, error) {
 	logger := log.With().Fields(map[string]interface{}{
 		"operation": "downloadObjectDiskParts",
 		"table":     fmt.Sprintf("%s.%s", backupTable.Database, backupTable.Table),
@@ -2292,7 +2308,12 @@ func (b *Backuper) downloadObjectDiskParts(ctx context.Context, backupName strin
 				// copy from required backup for required data parts, https://github.com/Altinity/clickhouse-backup/issues/865
 				if part.Required && backupMetadata.RequiredBackup != "" {
 					var findRecursiveErr error
-					srcBackupName, srcDiskName, findRecursiveErr = b.findObjectDiskPartRecursive(ctx, backupMetadata, backupTable, part, diskName, logger)
+					if chainCache != nil {
+						// Use the pre-built cache to avoid per-part S3 API calls and metadataCacheLock contention.
+						srcBackupName, srcDiskName, findRecursiveErr = b.findObjectDiskPartRecursiveCached(backupMetadata, backupTable, part, diskName, chainCache, logger)
+					} else {
+						srcBackupName, srcDiskName, findRecursiveErr = b.findObjectDiskPartRecursive(ctx, backupMetadata, backupTable, part, diskName, logger)
+					}
 					if findRecursiveErr != nil {
 						return 0, errors.WithMessage(findRecursiveErr, "findObjectDiskPartRecursive")
 					}
