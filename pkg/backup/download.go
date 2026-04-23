@@ -145,6 +145,16 @@ func (b *Backuper) Download(backupName string, tablePattern string, partitions [
 		}
 	}
 
+	// Prefetch metadata for the entire incremental backup chain once, before parallel goroutines.
+	// This prevents each of the N concurrent downloadTableData goroutines from independently
+	// calling BackupList (which issues S3 LIST + disk I/O + global lock) for the same
+	// RequiredBackup, turning O(N) remote calls into O(depth-of-chain) calls.
+	if remoteBackup.RequiredBackup != "" {
+		if prefetchErr := b.prefetchRemoteBackupMetadata(ctx, remoteBackup.RequiredBackup); prefetchErr != nil {
+			log.Warn().Err(prefetchErr).Msg("prefetchRemoteBackupMetadata failed, will fall back to per-goroutine fetching")
+		}
+	}
+
 	dataSize := uint64(0)
 	metadataSize := uint64(0)
 	b.isEmbedded = strings.Contains(remoteBackup.Tags, "embedded")
@@ -954,9 +964,9 @@ func (b *Backuper) downloadDiffParts(ctx context.Context, remoteBackup metadata.
 	diffRemoteFilesLock := &sync.Mutex{}
 	isRebalancedAfterHardLinks := false
 
-	requiredBackup, err := b.ReadBackupMetadataRemote(ctx, remoteBackup.RequiredBackup)
+	requiredBackup, err := b.ReadBackupMetadataRemoteCached(ctx, remoteBackup.RequiredBackup)
 	if err != nil {
-		return 0, errors.WithMessage(err, "ReadBackupMetadataRemote")
+		return 0, errors.WithMessage(err, "ReadBackupMetadataRemoteCached")
 	}
 	requiredTable, err := b.downloadTableMetadataIfNotExists(ctx, requiredBackup.BackupName, metadata.TableTitle{Database: table.Database, Table: table.Table})
 	if err != nil {
@@ -1168,9 +1178,9 @@ func (b *Backuper) findDiffBackupFilesRemote(ctx context.Context, backup metadat
 	log.Debug().Fields(map[string]interface{}{"database": table.Database, "table": table.Table, "part": part.Name, "logger": "findDiffBackupFilesRemote"}).Msg("start")
 	var err error
 	if requiredBackup == nil {
-		requiredBackup, err = b.ReadBackupMetadataRemote(ctx, backup.RequiredBackup)
+		requiredBackup, err = b.ReadBackupMetadataRemoteCached(ctx, backup.RequiredBackup)
 		if err != nil {
-			return nil, errors.WithMessage(err, "ReadBackupMetadataRemote")
+			return nil, errors.WithMessage(err, "ReadBackupMetadataRemoteCached")
 		}
 	}
 	if requiredTable == nil {

@@ -51,20 +51,70 @@ type Backuper struct {
 	resumableState         *resumable.State
 	shadowBackupUUIDs      []string
 	shadowBackupUUIDsMutex sync.Mutex
+	// remoteBackupMetadataCache is a per-operation read-only cache of remote backup metadata.
+	// It is populated once (before parallel goroutines start) by prefetchRemoteBackupMetadata
+	// and is safe for concurrent reads without a lock, since it is never modified after population.
+	remoteBackupMetadataCache map[string]*metadata.BackupMetadata
 }
 
 func NewBackuper(cfg *config.Config, opts ...BackuperOpt) *Backuper {
 	ch := clickhouse.NewClickHouse(&cfg.ClickHouse)
 	b := &Backuper{
-		cfg:  cfg,
-		ch:   ch,
-		vers: ch,
-		bs:   nil,
+		cfg:                       cfg,
+		ch:                        ch,
+		vers:                      ch,
+		bs:                        nil,
+		remoteBackupMetadataCache: make(map[string]*metadata.BackupMetadata),
 	}
 	for _, opt := range opts {
 		opt(b)
 	}
 	return b
+}
+
+// prefetchRemoteBackupMetadata fetches metadata for backupName and all its RequiredBackup ancestors
+// from remote storage exactly once, storing results in remoteBackupMetadataCache.
+// Must be called sequentially before parallel goroutines start.
+func (b *Backuper) prefetchRemoteBackupMetadata(ctx context.Context, backupName string) error {
+	if backupName == "" {
+		return nil
+	}
+	if _, alreadyCached := b.remoteBackupMetadataCache[backupName]; alreadyCached {
+		return nil
+	}
+	log.Debug().Str("backup", backupName).Msg("prefetchRemoteBackupMetadata: fetching from remote")
+	backupList, err := b.dst.BackupList(ctx, true, backupName)
+	if err != nil {
+		return errors.WithMessage(err, "prefetchRemoteBackupMetadata BackupList")
+	}
+	for i := range backupList {
+		if backupList[i].BackupName == backupName {
+			meta := backupList[i].BackupMetadata
+			b.remoteBackupMetadataCache[backupName] = &meta
+			// Recursively prefetch the entire incremental chain
+			if meta.RequiredBackup != "" {
+				if err = b.prefetchRemoteBackupMetadata(ctx, meta.RequiredBackup); err != nil {
+					return errors.WithMessagef(err, "prefetchRemoteBackupMetadata RequiredBackup %s", meta.RequiredBackup)
+				}
+			}
+			return nil
+		}
+	}
+	return errors.Errorf("prefetchRemoteBackupMetadata: %s not found on remote storage", backupName)
+}
+
+// ReadBackupMetadataRemoteCached returns backup metadata from the in-process cache populated by
+// prefetchRemoteBackupMetadata. Falls back to a live BackupList call when the cache is empty
+// (e.g., callers outside of a download/restore flow, such as upload diff).
+func (b *Backuper) ReadBackupMetadataRemoteCached(ctx context.Context, backupName string) (*metadata.BackupMetadata, error) {
+	if len(b.remoteBackupMetadataCache) > 0 {
+		if meta, ok := b.remoteBackupMetadataCache[backupName]; ok {
+			return meta, nil
+		}
+		// Entry not in cache – fetch it live and store it so subsequent calls are free.
+		log.Debug().Str("backup", backupName).Msg("ReadBackupMetadataRemoteCached: cache miss, fetching from remote")
+	}
+	return b.ReadBackupMetadataRemote(ctx, backupName)
 }
 
 // Classify need to log retries
