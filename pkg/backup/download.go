@@ -973,6 +973,16 @@ func (b *Backuper) downloadDiffParts(ctx context.Context, remoteBackup metadata.
 		log.Warn().Msgf("downloadTableMetadataIfNotExists %s / %s.%s return error", requiredBackup.BackupName, table.Database, table.Table)
 		return 0, errors.WithMessage(err, "downloadTableMetadataIfNotExists")
 	}
+	// If table doesn't exist in RequiredBackup, it means table was created after that backup,
+	// so there are no diff parts to download
+	if requiredTable == nil {
+		log.Debug().
+			Str("backup", remoteBackup.BackupName).
+			Str("requiredBackup", requiredBackup.BackupName).
+			Str("table", fmt.Sprintf("%s.%s", table.Database, table.Table)).
+			Msg("table did not exist in RequiredBackup, skipping diff parts download")
+		return 0, nil
+	}
 
 	for disk, parts := range table.Parts {
 		diskPath, diskExists := b.DiskToPathMap[disk]
