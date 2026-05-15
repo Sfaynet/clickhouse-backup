@@ -853,11 +853,32 @@ func (b *Backuper) downloadTableData(ctx context.Context, remoteBackup metadata.
 		}
 	}
 	if !b.isEmbedded && remoteBackup.RequiredBackup != "" {
-		diffBytes, err := b.downloadDiffParts(ctx, remoteBackup, table, dbAndTableDir, disks, hardlinkExistsFiles)
-		if err != nil {
-			return 0, errors.WithMessage(err, "downloadDiffParts")
+		// Check if table has any parts with Required flag before downloading diff parts
+		hasRequiredParts := false
+		for _, parts := range table.Parts {
+			for _, part := range parts {
+				if part.Required {
+					hasRequiredParts = true
+					break
+				}
+			}
+			if hasRequiredParts {
+				break
+			}
 		}
-		downloadedSize += uint64(diffBytes)
+
+		if hasRequiredParts {
+			diffBytes, err := b.downloadDiffParts(ctx, remoteBackup, table, dbAndTableDir, disks, hardlinkExistsFiles)
+			if err != nil {
+				return 0, errors.WithMessage(err, "downloadDiffParts")
+			}
+			downloadedSize += uint64(diffBytes)
+		} else {
+			log.Debug().
+				Str("backup", remoteBackup.BackupName).
+				Str("table", fmt.Sprintf("%s.%s", table.Database, table.Table)).
+				Msg("table has no parts with Required flag, skipping diff parts download")
+		}
 	}
 
 	return downloadedSize, nil
