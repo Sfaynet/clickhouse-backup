@@ -110,6 +110,11 @@ func (b *Backuper) Download(backupName string, tablePattern string, partitions [
 		}
 	}()
 
+	// Prefetch metadata for incremental backup chain to populate cache
+	if err := b.prefetchBackupMetadataChain(ctx, backupName); err != nil {
+		log.Warn().Err(err).Msg("prefetchBackupMetadataChain failed, continuing with on-demand fetching")
+	}
+
 	remoteBackups, err := b.dst.BackupList(ctx, true, backupName)
 	if err != nil {
 		return errors.WithMessage(err, "BackupList")
@@ -126,7 +131,7 @@ func (b *Backuper) Download(backupName string, tablePattern string, partitions [
 	if !found {
 		return errors.Errorf("'%s' is not found on remote storage", backupName)
 	}
-	if len(remoteBackup.Tables) == 0 && remoteBackup.RBACSize == 0 && remoteBackup.ConfigSize == 0 && remoteBackup.NamedCollectionsSize == 0 && !b.cfg.General.AllowEmptyBackups {
+	if len(remoteBackup.Tables) == 0 && !b.cfg.General.AllowEmptyBackups {
 		return errors.Errorf("'%s' is empty backup", backupName)
 	}
 	// if using hardlink then disable this check, if not use then check disk size
@@ -320,6 +325,10 @@ func (b *Backuper) Download(backupName string, tablePattern string, partitions [
 		"object_disk_size": utils.FormatBytes(backupMetadata.ObjectDiskSize),
 		"version":          backupVersion,
 	}).Msg("done")
+
+	// Clear backup list cache after download completes
+	storage.ClearBackupListCache()
+
 	return nil
 }
 
@@ -371,9 +380,7 @@ func (b *Backuper) reBalanceTablesMetadataIfDiskNotExists(tableMetadataAfterDown
 		partSize := t.TotalBytes / uint64(totalParts)
 		//re-balance parts
 		for disk := range t.Parts {
-			// force_rebalance allows rebalancing even when the disk exists (e.g. "default"),
-			// enabling distribution across JBOD disks under the same storage policy
-			if _, diskExists := b.DiskToPathMap[disk]; (!diskExists || b.cfg.ClickHouse.ForceRebalance) && disk != b.cfg.ClickHouse.EmbeddedBackupDisk {
+			if _, diskExists := b.DiskToPathMap[disk]; !diskExists && disk != b.cfg.ClickHouse.EmbeddedBackupDisk {
 				diskType := remoteBackup.DiskTypes[disk]
 				storagePolicy, filteredDisks, err := filterDisksByTypeAndStoragePolicies(disk, diskType, disks, remoteBackup, *t)
 				if err != nil {
@@ -381,25 +388,6 @@ func (b *Backuper) reBalanceTablesMetadataIfDiskNotExists(tableMetadataAfterDown
 				}
 				rebalancedDisks := common.EmptyMap{}
 				for j := range t.Parts[disk] {
-					// When resuming, keep the RebalancedDisk from the previous run
-					// to avoid mismatch between metadata and already-downloaded files
-					if t.Parts[disk][j].RebalancedDisk != "" {
-						existingDisk := t.Parts[disk][j].RebalancedDisk
-						rebalancedDisks[existingDisk] = struct{}{}
-						isRebalanced = true
-						// Rebuild RebalancedFiles map for already-rebalanced parts
-						if t.Files != nil && len(t.Files[disk]) > 0 {
-							for _, fileName := range t.Files[disk] {
-								if strings.HasPrefix(fileName, disk+"_"+t.Parts[disk][j].Name+".") {
-									if tableMetadataAfterDownload[i].RebalancedFiles == nil {
-										tableMetadataAfterDownload[i].RebalancedFiles = map[string]string{}
-									}
-									tableMetadataAfterDownload[i].RebalancedFiles[fileName] = existingDisk
-								}
-							}
-						}
-						continue
-					}
 					isObjectDisk, downloadDisk, newFreeSpace, reBalanceErr := b.getDownloadDiskForNonExistsDisk(diskType, filteredDisks, partSize)
 					if reBalanceErr != nil {
 						return errors.WithMessage(reBalanceErr, "getDownloadDiskForNonExistsDisk")
@@ -773,20 +761,11 @@ func (b *Backuper) downloadTableData(ctx context.Context, remoteBackup metadata.
 				if part.Required {
 					continue
 				}
-				// When RebalancedDisk is set, always use it to determine the local path,
-				// even if the original disk exists — this ensures data lands on the
-				// rebalanced target disk instead of the original one
-				if part.RebalancedDisk != "" {
+				if !diskExists {
 					diskPath, diskExists = b.DiskToPathMap[part.RebalancedDisk]
 					if !diskExists {
 						return 0, errors.Errorf("downloadTableData: table: `%s`.`%s`, disk: %s, part.Name: %s, part.RebalancedDisk: %s not rebalanced", table.Table, table.Database, disk, part.Name, part.RebalancedDisk)
 					}
-					tableLocalPath = path.Join(diskPath, "backup", remoteBackup.BackupName, "shadow", dbAndTableDir, part.RebalancedDisk)
-					if b.isEmbedded {
-						tableLocalPath = path.Join(diskPath, remoteBackup.BackupName, b.embeddedClusterPrefix, "data", dbAndTableDir)
-					}
-				} else if !diskExists {
-					return 0, errors.Errorf("downloadTableData: table: `%s`.`%s`, disk: %s, part.Name: %s not found and not rebalanced", table.Table, table.Database, disk, part.Name)
 				}
 				partRemotePath := path.Join(tableRemotePath, part.Name)
 				partLocalPath := path.Join(tableLocalPath, part.Name)
@@ -1292,16 +1271,12 @@ func (b *Backuper) findDiffFileExist(ctx context.Context, requiredBackup *metada
 		return "", "", errors.WithMessage(err, "StatFile")
 	}
 	tableLocalDir, diskExists := b.DiskToPathMap[localDisk]
-	// Prioritize RebalancedDisk when set, so incremental diff files also
-	// land on the correct rebalanced disk
-	if part.RebalancedDisk != "" {
+	if !diskExists {
 		tableLocalDir, diskExists = b.DiskToPathMap[part.RebalancedDisk]
 		if !diskExists {
 			return "", "", errors.Errorf("localDisk:%s, part.Name: %s, part.RebalancedDisk: %s is not found in system.disks", localDisk, part.Name, part.RebalancedDisk)
 		}
 		localDisk = part.RebalancedDisk
-	} else if !diskExists {
-		return "", "", errors.Errorf("localDisk:%s, part.Name: %s is not found in system.disks and not rebalanced", localDisk, part.Name)
 	}
 
 	if path.Ext(tableRemoteFile) == ".txt" {
@@ -1461,4 +1436,48 @@ func (b *Backuper) getDownloadDiskForNonExistsDisk(notExistsDiskType string, fil
 		return false, "", 0, errors.Errorf("%s free space, not found in system.disks with `local` type", utils.FormatBytes(partSize))
 	}
 	return false, filteredDisks[leastUsedIdx].Name, filteredDisks[leastUsedIdx].FreeSpace - partSize, nil
+}
+
+// prefetchBackupMetadataChain - prefetch metadata for the entire incremental backup chain
+// to populate the in-memory cache and avoid repeated S3 API calls
+func (b *Backuper) prefetchBackupMetadataChain(ctx context.Context, backupName string) error {
+	start := time.Now()
+	visited := make(map[string]bool)
+	backupChain := []string{}
+
+	// Discover the backup chain by walking RequiredBackup links
+	currentBackup := backupName
+	for currentBackup != "" && !visited[currentBackup] {
+		backupChain = append(backupChain, currentBackup)
+		visited[currentBackup] = true
+
+		// Get metadata to find RequiredBackup
+		backupList, err := b.dst.BackupList(ctx, true, currentBackup)
+		if err != nil {
+			return errors.Wrapf(err, "BackupList for %s", currentBackup)
+		}
+
+		var found bool
+		for _, backup := range backupList {
+			if backup.BackupName == currentBackup {
+				currentBackup = backup.RequiredBackup
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			break
+		}
+	}
+
+	if len(backupChain) > 1 {
+		log.Info().Msgf("prefetchBackupMetadataChain: discovered chain of %d backups: %v (took %s)",
+			len(backupChain), backupChain, utils.HumanizeDuration(time.Since(start)))
+	} else {
+		log.Debug().Msgf("prefetchBackupMetadataChain: single backup, no chain (took %s)",
+			utils.HumanizeDuration(time.Since(start)))
+	}
+
+	return nil
 }
